@@ -58,6 +58,9 @@ python3 -m unittest discover -s tests
 Python lint/format (Ruff):
 
 ```bash
+pipx install ruff
+pipx ensurepath  # if needed, then restart your shell
+
 ruff check .
 ruff format .
 ```
