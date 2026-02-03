@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>dev.warpception.warp-autocontinue</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/local/bin/warp-autocontinue</string>
+      <string>run</string>
+      <string>--require-frontmost</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/warp-autocontinue.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/warp-autocontinue.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <!-- Set these as needed; launchd does not automatically inherit your shell env. -->
+      <key>WARP_AUTOCONTINUE_EVAL</key>
+      <string>heuristic</string>
+
+      <!-- If using OpenAI:
+      <key>OPENAI_API_KEY</key>
+      <string>YOUR_KEY_HERE</string>
+      <key>OPENAI_MODEL</key>
+      <string>gpt-4.1-mini</string>
+      -->
+    </dict>
+  </dict>
+</plist>
