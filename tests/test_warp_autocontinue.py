@@ -28,7 +28,9 @@ def _make_uuid_framed_message(*, uuid: str, role: str, text: str) -> bytes:
         else wa.TASK_BLOB_TAG_ASSISTANT_TEXT
     )
     text_bytes = text.encode("utf-8")
-    inner = bytes([wa.TASK_BLOB_TAG_STRING]) + _encode_varint(len(text_bytes)) + text_bytes
+    inner = (
+        bytes([wa.TASK_BLOB_TAG_STRING]) + _encode_varint(len(text_bytes)) + text_bytes
+    )
     return uuid.encode("ascii") + bytes([tag]) + _encode_varint(len(inner)) + inner
 
 
@@ -87,7 +89,9 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(wa.get_recent_user_messages(msgs, 2), ["B", "C"])
 
     def test_heuristic_should_continue_errors_and_questions(self) -> None:
-        ok, _ = wa.heuristic_should_continue(assistant_text="Traceback (most recent call last):")
+        ok, _ = wa.heuristic_should_continue(
+            assistant_text="Traceback (most recent call last):"
+        )
         self.assertTrue(ok)
 
         ok, _ = wa.heuristic_should_continue(assistant_text="Should I proceed?")

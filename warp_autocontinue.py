@@ -29,7 +29,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-
 # -----------------
 # Constants / config
 # -----------------
@@ -46,9 +45,7 @@ WARP_DB_PREVIEW_SUBPATH = Path("dev.warp.Warp-Preview/warp.sqlite")
 WARP_DB_STABLE_SUBPATH = Path("dev.warp.Warp-Stable/warp.sqlite")
 
 DEFAULT_WARP_BUNDLE_ID = "dev.warp.Warp-Preview"
-DEFAULT_STATE_SUBPATH = Path(
-    "Library/Application Support/warp-autocontinue/state.json"
-)
+DEFAULT_STATE_SUBPATH = Path("Library/Application Support/warp-autocontinue/state.json")
 DEFAULT_CONTINUE_MESSAGE = "Please continue"
 
 # macOS virtual keycode for the Return/Enter key.
@@ -108,7 +105,7 @@ OPENAI_EVAL_SYSTEM_PROMPT = (
     "decide if the assistant response is a final, complete deliverable. "
     "If it is incomplete/progress-only/asking questions/blocked by errors, choose continue. "
     "If it is complete and no further work is needed, choose stop. "
-    "Respond ONLY as JSON: {\"action\": \"continue\"|\"stop\", \"reason\": \"...\"}."
+    'Respond ONLY as JSON: {"action": "continue"|"stop", "reason": "..."}.'
 )
 
 
@@ -316,7 +313,9 @@ def extract_messages_from_agent_task_blob(blob: bytes) -> list[ExtractedMessage]
     return msgs
 
 
-def get_last_assistant_message(msgs: list[ExtractedMessage]) -> Optional[ExtractedMessage]:
+def get_last_assistant_message(
+    msgs: list[ExtractedMessage],
+) -> Optional[ExtractedMessage]:
     for m in reversed(msgs):
         if m.role == "assistant":
             return m
@@ -478,7 +477,7 @@ def send_user_message_via_osascript(
     # Type and press Return.
     script = (
         'tell application "System Events"\n'
-        f'  keystroke {json.dumps(message)}\n'
+        f"  keystroke {json.dumps(message)}\n"
         f"  key code {MACOS_KEYCODE_RETURN}\n"
         "end tell\n"
     )
@@ -843,7 +842,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_once_command(*, args: argparse.Namespace, db_path: Path, state_path: Path) -> None:
+def run_once_command(
+    *, args: argparse.Namespace, db_path: Path, state_path: Path
+) -> None:
     decide_and_maybe_continue(
         db_path=db_path,
         warp_bundle_id=args.warp_bundle_id,
@@ -862,7 +863,9 @@ def run_once_command(*, args: argparse.Namespace, db_path: Path, state_path: Pat
         eprint(json.dumps(st, indent=2))
 
 
-def run_loop_command(*, args: argparse.Namespace, db_path: Path, state_path: Path) -> None:
+def run_loop_command(
+    *, args: argparse.Namespace, db_path: Path, state_path: Path
+) -> None:
     interval = max(0.25, args.poll_interval)
     while True:
         try:
