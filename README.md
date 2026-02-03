@@ -9,7 +9,10 @@ It monitors Warp’s on-disk state (`warp.sqlite`) and, when an agent run return
 This is intentionally best-effort and may break across Warp updates.
 
 ## How it works (high level)
-- Reads Warp’s local SQLite DB under `~/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support/.../warp.sqlite`.
+- Reads Warp’s local SQLite DB (fixed path per channel):
+  - Preview: `~/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support/dev.warp.Warp-Preview/warp.sqlite`
+  - Stable: `~/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support/dev.warp.Warp-Stable/warp.sqlite`
+  - Or override with `--db-path` / `WARP_DB_PATH`.
 - Pulls the most recently modified `agent_tasks.task` blob and extracts user/assistant messages by scanning for UUID-prefixed protobuf string fields.
 - If a Plan exists, it’s stored as a notebook row (`notebooks.data`) keyed by `ai_document_id` and referenced from the task blob.
 - If the evaluator says “continue”, it uses AppleScript (System Events) to type `Please continue` into Warp and press Return.
