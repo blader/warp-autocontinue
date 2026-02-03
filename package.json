@@ -1,0 +1,11 @@
+{
+  "name": "warp-autocontinue",
+  "private": true,
+  "devDependencies": {
+    "prettier": "^3.5.1"
+  },
+  "scripts": {
+    "prettier:check": "prettier --check --ignore-unknown .",
+    "prettier:write": "prettier --write --ignore-unknown ."
+  }
+}

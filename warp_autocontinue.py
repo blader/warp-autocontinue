@@ -29,7 +29,95 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+# -----------------
+# Constants / config
+# -----------------
 
+# Warp stores on-disk data in a macOS Group Container.
+# This is a stable identifier for Warp.
+WARP_GROUP_CONTAINER_ID = "2BBY89MBSN.dev.warp"
+
+# Warp DB location is fixed per channel.
+WARP_APP_SUPPORT_SUBPATH = Path(
+    f"Library/Group Containers/{WARP_GROUP_CONTAINER_ID}/Library/Application Support"
+)
+WARP_DB_PREVIEW_SUBPATH = Path("dev.warp.Warp-Preview/warp.sqlite")
+WARP_DB_STABLE_SUBPATH = Path("dev.warp.Warp-Stable/warp.sqlite")
+
+DEFAULT_WARP_BUNDLE_ID = "dev.warp.Warp-Preview"
+DEFAULT_STATE_SUBPATH = Path("Library/Application Support/warp-autocontinue/state.json")
+DEFAULT_CONTINUE_MESSAGE = "Please continue"
+
+# macOS virtual keycode for the Return/Enter key.
+MACOS_KEYCODE_RETURN = 36
+
+# Heuristic evaluator keywords.
+HEURISTIC_ERROR_MARKERS = (
+    "traceback",
+    "error:",
+    "failed",
+    "exception",
+    "exit_code",
+)
+HEURISTIC_WAITING_MARKERS = (
+    "before i",
+    "i need",
+    "need your",
+    "can you",
+    "could you",
+    "please confirm",
+    "please tell me",
+    "which one",
+    "do you want",
+    "should i",
+    "let me know",
+    "what should",
+    "clarif",
+    "i can proceed",
+    "waiting for",
+)
+HEURISTIC_PROGRESS_MARKERS = (
+    "next i will",
+    "next, i",
+    "next step",
+    "i will now",
+    "i'm going to",
+    "i am going to",
+    "still need to",
+    "remaining",
+    "not finished",
+    "in progress",
+    "working on",
+    "investigating",
+    "todo",
+)
+HEURISTIC_DONE_MARKERS = (
+    "all set",
+    "done",
+    "completed",
+    "finished",
+    "wrapped up",
+)
+
+OPENAI_EVAL_SYSTEM_PROMPT = (
+    "You are a strict evaluator for an agentic coding session. "
+    "Given recent user messages, an optional plan, and the last assistant response, "
+    "decide if the assistant response is a final, complete deliverable. "
+    "If it is incomplete/progress-only/asking questions/blocked by errors, choose continue. "
+    "If it is complete and no further work is needed, choose stop. "
+    'Respond ONLY as JSON: {"action": "continue"|"stop", "reason": "..."}.'
+)
+
+
+# Message extraction from `agent_tasks.task` relies on a stable-but-undocumented
+# protobuf-ish framing. These constants make the reverse-engineering assumptions
+# explicit and easy to update if Warp changes its internal representation.
+UUID_ASCII_LEN = 36
+TASK_BLOB_TAG_USER_TEXT = 0x12
+TASK_BLOB_TAG_ASSISTANT_TEXT = 0x1A
+TASK_BLOB_TAG_STRING = 0x0A
+
+# Regex used to find UUID framing in Warp's agent task blobs.
 UUID_RE_BYTES = re.compile(
     rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
@@ -70,36 +158,24 @@ def locate_warp_db_path(explicit: Optional[str] = None) -> Path:
             raise FileNotFoundError(f"warp sqlite db not found at: {p}")
         return p
 
-    app_support = (
-        Path.home()
-        / "Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support"
+    app_support = Path.home() / WARP_APP_SUPPORT_SUBPATH
+
+    # Warp stores its sqlite DB in a fixed location per channel.
+    # We intentionally keep this simple and only check Preview then Stable.
+    preview = app_support / WARP_DB_PREVIEW_SUBPATH
+    if preview.exists():
+        return preview
+
+    stable = app_support / WARP_DB_STABLE_SUBPATH
+    if stable.exists():
+        return stable
+
+    raise FileNotFoundError(
+        "Could not find Warp sqlite DB. Tried:\n"
+        f"- {preview}\n"
+        f"- {stable}\n\n"
+        "If you use a different Warp channel/build, pass --db-path (or set WARP_DB_PATH)."
     )
-    if not app_support.exists():
-        raise FileNotFoundError(
-            f"Warp app-support dir not found at: {app_support} (is Warp installed?)"
-        )
-
-    candidates: list[tuple[float, Path]] = []
-    for child in app_support.iterdir():
-        if not child.is_dir():
-            continue
-        if not child.name.startswith("dev.warp.Warp"):
-            continue
-        db = child / "warp.sqlite"
-        if not db.exists():
-            continue
-        wal = child / "warp.sqlite-wal"
-        mtime = wal.stat().st_mtime if wal.exists() else db.stat().st_mtime
-        candidates.append((mtime, db))
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"No warp.sqlite found under: {app_support} (checked dev.warp.Warp*)"
-        )
-
-    # Pick the most recently active DB.
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
 
 
 def open_warp_db_ro(db_path: Path) -> sqlite3.Connection:
@@ -137,6 +213,14 @@ def get_latest_agent_task(
 
 
 def read_varint(buf: bytes, i: int) -> tuple[int, int]:
+    """Decode a protobuf varint starting at offset i.
+
+    Returns: (value, next_offset)
+
+    We only need a tiny subset of protobuf parsing to extract strings from
+    Warp's `agent_tasks.task` blob.
+    """
+
     shift = 0
     val = 0
     while i < len(buf):
@@ -152,19 +236,26 @@ def read_varint(buf: bytes, i: int) -> tuple[int, int]:
 
 
 def _parse_uuid_framed_message_at(buf: bytes, pos: int) -> Optional[ExtractedMessage]:
-    # Observed structure in Warp agent_tasks.task:
-    #   <uuid-as-ascii-36-bytes><tag><len-varint><chunk>
-    # where tag is 0x12 (role=user) or 0x1A (role=assistant)
-    # and chunk begins with: 0x0A <strlen-varint> <utf8-bytes>
-    uuid_bytes = buf[pos : pos + 36]
-    if len(uuid_bytes) != 36:
+    """Try to parse a single user/assistant message anchored at a UUID.
+
+    Observed structure inside Warp's `agent_tasks.task` (BLOB):
+    - At `pos`: a UUID encoded as 36 ASCII bytes.
+    - Immediately after: a protobuf-ish field tag distinguishing user vs assistant.
+    - Next: a length-delimited nested message whose first field is a UTF-8 string.
+
+    If Warp changes this framing, message extraction will fail *silently* (None)
+    and the tool will effectively no-op.
+    """
+
+    uuid_bytes = buf[pos : pos + UUID_ASCII_LEN]
+    if len(uuid_bytes) != UUID_ASCII_LEN:
         return None
 
-    tag_pos = pos + 36
+    tag_pos = pos + UUID_ASCII_LEN
     if tag_pos >= len(buf):
         return None
     tag = buf[tag_pos]
-    if tag not in (0x12, 0x1A):
+    if tag not in (TASK_BLOB_TAG_USER_TEXT, TASK_BLOB_TAG_ASSISTANT_TEXT):
         return None
 
     try:
@@ -176,7 +267,7 @@ def _parse_uuid_framed_message_at(buf: bytes, pos: int) -> Optional[ExtractedMes
         return None
     chunk = buf[j : j + chunk_len]
 
-    if not chunk or chunk[0] != 0x0A:
+    if not chunk or chunk[0] != TASK_BLOB_TAG_STRING:
         return None
 
     try:
@@ -197,7 +288,7 @@ def _parse_uuid_framed_message_at(buf: bytes, pos: int) -> Optional[ExtractedMes
     if len(text) < 2:
         return None
 
-    role = "user" if tag == 0x12 else "assistant"
+    role = "user" if tag == TASK_BLOB_TAG_USER_TEXT else "assistant"
     return ExtractedMessage(
         offset=pos,
         uuid=uuid_bytes.decode("ascii", "ignore"),
@@ -207,6 +298,12 @@ def _parse_uuid_framed_message_at(buf: bytes, pos: int) -> Optional[ExtractedMes
 
 
 def extract_messages_from_agent_task_blob(blob: bytes) -> list[ExtractedMessage]:
+    """Extract user/assistant messages from a Warp `agent_tasks.task` blob.
+
+    This is intentionally best-effort and relies on internal storage details.
+    We scan for UUIDs first to avoid attempting to fully decode the protobuf.
+    """
+
     msgs: list[ExtractedMessage] = []
     for m in UUID_RE_BYTES.finditer(blob):
         em = _parse_uuid_framed_message_at(blob, m.start())
@@ -216,7 +313,9 @@ def extract_messages_from_agent_task_blob(blob: bytes) -> list[ExtractedMessage]
     return msgs
 
 
-def get_last_assistant_message(msgs: list[ExtractedMessage]) -> Optional[ExtractedMessage]:
+def get_last_assistant_message(
+    msgs: list[ExtractedMessage],
+) -> Optional[ExtractedMessage]:
     for m in reversed(msgs):
         if m.role == "assistant":
             return m
@@ -240,6 +339,15 @@ def get_recent_user_messages(
 def get_latest_plan_doc_for_blob(
     conn: sqlite3.Connection, blob: bytes
 ) -> Optional[PlanDoc]:
+    """Best-effort extraction of the in-context Plan for a given agent task blob.
+
+    Warp's plan documents appear in sqlite as:
+    - `ai_document_panes.document_id` (the logical plan document id)
+    - `notebooks.ai_document_id` (key to the markdown stored in `notebooks.data`)
+
+    The agent task blob embeds the document id; we use that as our join key.
+    """
+
     # Plans created by the agent are stored as notebooks where notebooks.ai_document_id
     # matches ai_document_panes.document_id.
     panes = conn.execute(
@@ -273,6 +381,26 @@ def get_latest_plan_doc_for_blob(
 
 
 def load_state(state_path: Path) -> dict[str, Any]:
+    """Load the debounce state file.
+
+    Schema (best-effort, may evolve):
+    {
+      "conversations": {
+        "<conversation_id>": {
+          "last_assistant_uuid": "...",
+          "last_action": "continue"|"stop",
+          "last_reason": "...",
+          "last_modified_at": "...",
+          "sent_continue": true|false,
+          "sent_continue_ts": <float epoch seconds>,
+          "sent_continue_result": "dry_run"|"ok"|"skipped"
+        }
+      }
+    }
+
+    If the file is missing/corrupt, we treat it as empty.
+    """
+
     if not state_path.exists():
         return {"conversations": {}}
     try:
@@ -282,6 +410,11 @@ def load_state(state_path: Path) -> dict[str, Any]:
 
 
 def save_state(state_path: Path, state: dict[str, Any]) -> None:
+    """Atomically write state.json.
+
+    We write to a temp file and rename to avoid partially-written JSON.
+    """
+
     state_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_path.with_suffix(state_path.suffix + ".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
@@ -308,6 +441,18 @@ def send_user_message_via_osascript(
     require_frontmost: bool,
     allow_activate: bool,
 ) -> bool:
+    """Type a message into Warp's input editor and press Return.
+
+    This uses AppleScript/System Events, which has no semantic understanding of
+    "which text box" it's typing into.
+
+    Safety model:
+    - If require_frontmost=True (default), we only type if Warp is already
+      frontmost.
+    - If allow_activate=True, we first activate Warp and then verify it's
+      frontmost before typing.
+    - Otherwise, we do nothing (too risky).
+    """
     if require_frontmost:
         if frontmost_bundle_id() != warp_bundle_id:
             return False
@@ -332,8 +477,8 @@ def send_user_message_via_osascript(
     # Type and press Return.
     script = (
         'tell application "System Events"\n'
-        f'  keystroke {json.dumps(message)}\n'
-        "  key code 36\n"
+        f"  keystroke {json.dumps(message)}\n"
+        f"  key code {MACOS_KEYCODE_RETURN}\n"
         "end tell\n"
     )
     res = subprocess.run(
@@ -349,7 +494,7 @@ def heuristic_should_continue(*, assistant_text: str) -> tuple[bool, str]:
     tl = t.lower()
 
     # Errors / failures: tend to need another attempt.
-    if any(x in tl for x in ["traceback", "error:", "failed", "exception", "exit_code"]):
+    if any(x in tl for x in HEURISTIC_ERROR_MARKERS):
         return True, "assistant message looks like an error"
 
     # If it's asking a question, treat as paused.
@@ -357,51 +502,15 @@ def heuristic_should_continue(*, assistant_text: str) -> tuple[bool, str]:
         return True, "assistant asked a question"
 
     # Common “waiting for user” phrases.
-    if any(
-        x in tl
-        for x in [
-            "before i",
-            "i need",
-            "need your",
-            "can you",
-            "could you",
-            "please confirm",
-            "please tell me",
-            "which one",
-            "do you want",
-            "should i",
-            "let me know",
-            "what should",
-            "clarif",
-            "i can proceed",
-            "waiting for",
-        ]
-    ):
+    if any(x in tl for x in HEURISTIC_WAITING_MARKERS):
         return True, "assistant appears to be waiting for user input"
 
     # Progress / unfinished work signals.
-    if any(
-        x in tl
-        for x in [
-            "next i will",
-            "next, i",
-            "next step",
-            "i will now",
-            "i'm going to",
-            "i am going to",
-            "still need to",
-            "remaining",
-            "not finished",
-            "in progress",
-            "working on",
-            "investigating",
-            "todo",
-        ]
-    ):
+    if any(x in tl for x in HEURISTIC_PROGRESS_MARKERS):
         return True, "assistant appears to be mid-task/progress-only"
 
     # If it looks like a final summary, stop.
-    if any(x in tl for x in ["all set", "done", "completed", "finished", "wrapped up"]):
+    if any(x in tl for x in HEURISTIC_DONE_MARKERS):
         return False, "assistant appears to be done"
 
     # Default: do nothing.
@@ -421,14 +530,7 @@ def openai_eval(
 
     url = base_url.rstrip("/") + "/chat/completions"
 
-    system = (
-        "You are a strict evaluator for an agentic coding session. "
-        "Given recent user messages, an optional plan, and the last assistant response, "
-        "decide if the assistant response is a final, complete deliverable. "
-        "If it is incomplete/progress-only/asking questions/blocked by errors, choose continue. "
-        "If it is complete and no further work is needed, choose stop. "
-        "Respond ONLY as JSON: {\"action\": \"continue\"|\"stop\", \"reason\": \"...\"}."
-    )
+    system = OPENAI_EVAL_SYSTEM_PROMPT
 
     payload = {
         "model": model,
@@ -507,6 +609,67 @@ def build_eval_prompt(
     return "\n".join(parts)
 
 
+def evaluate_action(
+    *,
+    evaluator: str,
+    prompt: str,
+    assistant_text: str,
+) -> tuple[str, str]:
+    """Return (action, reason).
+
+    action is the string "continue" or "stop".
+
+    This is deliberately strict: anything that looks like a partial answer,
+    a progress update, an error, or a question should become "continue".
+    """
+
+    if evaluator == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip()
+        if not api_key:
+            ok, h_reason = heuristic_should_continue(assistant_text=assistant_text)
+            return "continue" if ok else "stop", f"OPENAI_API_KEY not set; {h_reason}"
+
+        try:
+            return openai_eval(
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                assistant_text_for_heuristic=assistant_text,
+            )
+        except (urllib.error.URLError, KeyError, ValueError) as e:
+            ok, h_reason = heuristic_should_continue(assistant_text=assistant_text)
+            action = "continue" if ok else "stop"
+            return action, f"openai error: {e}; {h_reason}"
+
+    ok, reason = heuristic_should_continue(assistant_text=assistant_text)
+    return ("continue" if ok else "stop"), reason
+
+
+def maybe_send_continue(
+    *,
+    warp_bundle_id: str,
+    allow_activate: bool,
+    require_frontmost: bool,
+    dry_run: bool,
+) -> str:
+    """Send the default continue message.
+
+    Returns a small string suitable for writing to state.json.
+    """
+
+    if dry_run:
+        return "dry_run"
+
+    ok = send_user_message_via_osascript(
+        warp_bundle_id=warp_bundle_id,
+        message=DEFAULT_CONTINUE_MESSAGE,
+        require_frontmost=require_frontmost,
+        allow_activate=allow_activate,
+    )
+    return "ok" if ok else "skipped"
+
+
 def decide_and_maybe_continue(
     *,
     db_path: Path,
@@ -549,35 +712,11 @@ def decide_and_maybe_continue(
             max_plan_chars=max_plan_chars,
         )
 
-        action = "stop"
-        reason = ""
-
-        if evaluator == "openai":
-            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-            model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip()
-            if not api_key:
-                ok, h_reason = heuristic_should_continue(
-                    assistant_text=last_assistant.text
-                )
-                action = "continue" if ok else "stop"
-                reason = f"OPENAI_API_KEY not set; {h_reason}"
-            else:
-                try:
-                    action, reason = openai_eval(
-                        api_key=api_key,
-                        model=model,
-                        prompt=prompt,
-                        assistant_text_for_heuristic=last_assistant.text,
-                    )
-                except (urllib.error.URLError, KeyError, ValueError) as e:
-                    ok, h_reason = heuristic_should_continue(
-                        assistant_text=last_assistant.text
-                    )
-                    action = "continue" if ok else "stop"
-                    reason = f"openai error: {e}; {h_reason}"
-        else:
-            ok, reason = heuristic_should_continue(assistant_text=last_assistant.text)
-            action = "continue" if ok else "stop"
+        action, reason = evaluate_action(
+            evaluator=evaluator,
+            prompt=prompt,
+            assistant_text=last_assistant.text,
+        )
 
         conv_state["last_assistant_uuid"] = last_assistant.uuid
         conv_state["last_action"] = action
@@ -587,16 +726,12 @@ def decide_and_maybe_continue(
         if action == "continue":
             conv_state["sent_continue"] = True
             conv_state["sent_continue_ts"] = time.time()
-            if dry_run:
-                conv_state["sent_continue_result"] = "dry_run"
-            else:
-                ok = send_user_message_via_osascript(
-                    warp_bundle_id=warp_bundle_id,
-                    message="Please continue",
-                    require_frontmost=require_frontmost,
-                    allow_activate=allow_activate,
-                )
-                conv_state["sent_continue_result"] = "ok" if ok else "skipped"
+            conv_state["sent_continue_result"] = maybe_send_continue(
+                warp_bundle_id=warp_bundle_id,
+                allow_activate=allow_activate,
+                require_frontmost=require_frontmost,
+                dry_run=dry_run,
+            )
         else:
             conv_state["sent_continue"] = False
 
@@ -605,7 +740,7 @@ def decide_and_maybe_continue(
         conn.close()
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="warp-autocontinue",
         description="Auto-send 'Please continue' when Warp's agent pauses with an incomplete response.",
@@ -618,8 +753,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--warp-bundle-id",
-        default=os.environ.get("WARP_BUNDLE_ID", "dev.warp.Warp-Preview"),
-        help="Warp bundle identifier used for frontmost checks (default: dev.warp.Warp-Preview).",
+        default=os.environ.get("WARP_BUNDLE_ID", DEFAULT_WARP_BUNDLE_ID),
+        help=(
+            "Warp bundle identifier used for frontmost checks "
+            f"(default: {DEFAULT_WARP_BUNDLE_ID})."
+        ),
     )
     parser.add_argument(
         "--conversation-id",
@@ -630,12 +768,12 @@ def main() -> None:
         "--state-path",
         default=os.environ.get(
             "WARP_AUTOCONTINUE_STATE",
-            str(
-                Path.home()
-                / "Library/Application Support/warp-autocontinue/state.json"
-            ),
+            str(Path.home() / DEFAULT_STATE_SUBPATH),
         ),
-        help="State file path for debouncing (default: ~/Library/Application Support/warp-autocontinue/state.json).",
+        help=(
+            "State file path for debouncing "
+            "(default: ~/Library/Application Support/warp-autocontinue/state.json)."
+        ),
     )
     parser.add_argument(
         "--max-user-messages",
@@ -655,6 +793,7 @@ def main() -> None:
         default=os.environ.get("WARP_AUTOCONTINUE_EVAL", "heuristic"),
         help="Evaluator to decide whether to continue.",
     )
+
     frontmost_group = parser.add_mutually_exclusive_group()
     frontmost_group.add_argument(
         "--require-frontmost",
@@ -700,49 +839,66 @@ def main() -> None:
         help="Polling interval in seconds.",
     )
 
+    return parser
+
+
+def run_once_command(
+    *, args: argparse.Namespace, db_path: Path, state_path: Path
+) -> None:
+    decide_and_maybe_continue(
+        db_path=db_path,
+        warp_bundle_id=args.warp_bundle_id,
+        conversation_id=args.conversation_id,
+        state_path=state_path,
+        max_user_messages=args.max_user_messages,
+        max_plan_chars=args.max_plan_chars,
+        evaluator=args.evaluator,
+        allow_activate=args.allow_activate,
+        require_frontmost=args.require_frontmost,
+        dry_run=args.dry_run,
+    )
+
+    if args.print_debug:
+        st = load_state(state_path)
+        eprint(json.dumps(st, indent=2))
+
+
+def run_loop_command(
+    *, args: argparse.Namespace, db_path: Path, state_path: Path
+) -> None:
+    interval = max(0.25, args.poll_interval)
+    while True:
+        try:
+            decide_and_maybe_continue(
+                db_path=db_path,
+                warp_bundle_id=args.warp_bundle_id,
+                conversation_id=args.conversation_id,
+                state_path=state_path,
+                max_user_messages=args.max_user_messages,
+                max_plan_chars=args.max_plan_chars,
+                evaluator=args.evaluator,
+                allow_activate=args.allow_activate,
+                require_frontmost=args.require_frontmost,
+                dry_run=args.dry_run,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            eprint(f"warp-autocontinue: error: {e}")
+        time.sleep(interval)
+
+
+def main() -> None:
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     db_path = locate_warp_db_path(args.db_path)
     state_path = Path(args.state_path).expanduser()
 
     if args.cmd == "once":
-        decide_and_maybe_continue(
-            db_path=db_path,
-            warp_bundle_id=args.warp_bundle_id,
-            conversation_id=args.conversation_id,
-            state_path=state_path,
-            max_user_messages=args.max_user_messages,
-            max_plan_chars=args.max_plan_chars,
-            evaluator=args.evaluator,
-            allow_activate=args.allow_activate,
-            require_frontmost=args.require_frontmost,
-            dry_run=args.dry_run,
-        )
-        if args.print_debug:
-            st = load_state(state_path)
-            eprint(json.dumps(st, indent=2))
-
+        run_once_command(args=args, db_path=db_path, state_path=state_path)
     elif args.cmd == "run":
-        interval = max(0.25, args.poll_interval)
-        while True:
-            try:
-                decide_and_maybe_continue(
-                    db_path=db_path,
-                    warp_bundle_id=args.warp_bundle_id,
-                    conversation_id=args.conversation_id,
-                    state_path=state_path,
-                    max_user_messages=args.max_user_messages,
-                    max_plan_chars=args.max_plan_chars,
-                    evaluator=args.evaluator,
-                    allow_activate=args.allow_activate,
-                    require_frontmost=args.require_frontmost,
-                    dry_run=args.dry_run,
-                )
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                eprint(f"warp-autocontinue: error: {e}")
-            time.sleep(interval)
+        run_loop_command(args=args, db_path=db_path, state_path=state_path)
 
 
 if __name__ == "__main__":
