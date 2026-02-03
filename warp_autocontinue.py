@@ -741,7 +741,7 @@ def decide_and_maybe_continue(
         conn.close()
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="warp-autocontinue",
         description="Auto-send 'Please continue' when Warp's agent pauses with an incomplete response.",
@@ -794,6 +794,7 @@ def main() -> None:
         default=os.environ.get("WARP_AUTOCONTINUE_EVAL", "heuristic"),
         help="Evaluator to decide whether to continue.",
     )
+
     frontmost_group = parser.add_mutually_exclusive_group()
     frontmost_group.add_argument(
         "--require-frontmost",
@@ -839,49 +840,62 @@ def main() -> None:
         help="Polling interval in seconds.",
     )
 
+    return parser
+
+
+def run_once_command(*, args: argparse.Namespace, db_path: Path, state_path: Path) -> None:
+    decide_and_maybe_continue(
+        db_path=db_path,
+        warp_bundle_id=args.warp_bundle_id,
+        conversation_id=args.conversation_id,
+        state_path=state_path,
+        max_user_messages=args.max_user_messages,
+        max_plan_chars=args.max_plan_chars,
+        evaluator=args.evaluator,
+        allow_activate=args.allow_activate,
+        require_frontmost=args.require_frontmost,
+        dry_run=args.dry_run,
+    )
+
+    if args.print_debug:
+        st = load_state(state_path)
+        eprint(json.dumps(st, indent=2))
+
+
+def run_loop_command(*, args: argparse.Namespace, db_path: Path, state_path: Path) -> None:
+    interval = max(0.25, args.poll_interval)
+    while True:
+        try:
+            decide_and_maybe_continue(
+                db_path=db_path,
+                warp_bundle_id=args.warp_bundle_id,
+                conversation_id=args.conversation_id,
+                state_path=state_path,
+                max_user_messages=args.max_user_messages,
+                max_plan_chars=args.max_plan_chars,
+                evaluator=args.evaluator,
+                allow_activate=args.allow_activate,
+                require_frontmost=args.require_frontmost,
+                dry_run=args.dry_run,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            eprint(f"warp-autocontinue: error: {e}")
+        time.sleep(interval)
+
+
+def main() -> None:
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     db_path = locate_warp_db_path(args.db_path)
     state_path = Path(args.state_path).expanduser()
 
     if args.cmd == "once":
-        decide_and_maybe_continue(
-            db_path=db_path,
-            warp_bundle_id=args.warp_bundle_id,
-            conversation_id=args.conversation_id,
-            state_path=state_path,
-            max_user_messages=args.max_user_messages,
-            max_plan_chars=args.max_plan_chars,
-            evaluator=args.evaluator,
-            allow_activate=args.allow_activate,
-            require_frontmost=args.require_frontmost,
-            dry_run=args.dry_run,
-        )
-        if args.print_debug:
-            st = load_state(state_path)
-            eprint(json.dumps(st, indent=2))
-
+        run_once_command(args=args, db_path=db_path, state_path=state_path)
     elif args.cmd == "run":
-        interval = max(0.25, args.poll_interval)
-        while True:
-            try:
-                decide_and_maybe_continue(
-                    db_path=db_path,
-                    warp_bundle_id=args.warp_bundle_id,
-                    conversation_id=args.conversation_id,
-                    state_path=state_path,
-                    max_user_messages=args.max_user_messages,
-                    max_plan_chars=args.max_plan_chars,
-                    evaluator=args.evaluator,
-                    allow_activate=args.allow_activate,
-                    require_frontmost=args.require_frontmost,
-                    dry_run=args.dry_run,
-                )
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                eprint(f"warp-autocontinue: error: {e}")
-            time.sleep(interval)
+        run_loop_command(args=args, db_path=db_path, state_path=state_path)
 
 
 if __name__ == "__main__":
